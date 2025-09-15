@@ -478,18 +478,10 @@ Context::create_component_common(vr::PropertyContainerHandle_t container,
 		return vr::VRInputError_InvalidHandle;
 	}
 	if (xrt_input *input = device->get_input_from_name(name); input) {
-		CTX_DEBUG("creating component %s", name);
+		CTX_DEBUG("creating component %s for %p", name, (void *)device);
 		vr::VRInputComponentHandle_t handle = new_handle();
 		handle_to_input[handle] = input;
 		*pHandle = handle;
-	} else if (device != hmd) {
-		auto *controller = static_cast<ControllerDevice *>(device);
-		if (IndexFingerInput *finger = controller->get_finger_from_name(name); finger) {
-			CTX_DEBUG("creating finger component %s", name);
-			vr::VRInputComponentHandle_t handle = new_handle();
-			handle_to_finger[handle] = finger;
-			*pHandle = handle;
-		}
 	}
 	return vr::VRInputError_None;
 }
@@ -592,21 +584,6 @@ Context::UpdateScalarComponent(vr::VRInputComponentHandle_t ulComponent, float f
 		} else {
 			input->value.vec1.x = fNewValue;
 		}
-	} else {
-		if (ulComponent != vr::k_ulInvalidInputComponentHandle) {
-			if (auto finger_input = handle_to_finger.find(ulComponent);
-			    finger_input != handle_to_finger.end() && finger_input->second) {
-				auto now = std::chrono::steady_clock::now();
-				std::chrono::duration<double, std::chrono::seconds::period> offset_dur(fTimeOffset);
-				std::chrono::duration offset = (now + offset_dur).time_since_epoch();
-				int64_t timestamp =
-				    std::chrono::duration_cast<std::chrono::nanoseconds>(offset).count();
-				finger_input->second->timestamp = timestamp;
-				finger_input->second->value = fNewValue;
-			} else {
-				CTX_WARN("Unmapped component %" PRIu64, ulComponent);
-			}
-		}
 	}
 	return vr::VRInputError_None;
 }
@@ -648,6 +625,33 @@ Context::CreateSkeletonComponent(vr::PropertyContainerHandle_t ulContainer,
                                  uint32_t unGripLimitTransformCount,
                                  vr::VRInputComponentHandle_t *pHandle)
 {
+	std::string_view path(pchSkeletonPath); // should be /skeleton/hand/left or /skeleton/hand/right
+	std::string_view skeleton_pfx("/skeleton/hand/");
+	if (!path.starts_with(skeleton_pfx)) {
+		CTX_ERR("Got invalid skeleton path: %s", std::string(path).c_str());
+		return vr::VRInputError_InvalidSkeleton;
+	}
+
+	if (auto ret = create_component_common(ulContainer, pchSkeletonPath, pHandle); ret != vr::VRInputError_None) {
+		return ret;
+	}
+
+	auto *device = static_cast<ControllerDevice *>(prop_container_to_device(ulContainer));
+	path.remove_prefix(skeleton_pfx.size());
+	xrt_hand hand;
+	if (path == "left") {
+		hand = XRT_HAND_LEFT;
+	} else if (path == "right") {
+		hand = XRT_HAND_RIGHT;
+	} else {
+		CTX_ERR("Got invalid skeleton path suffix: %s", std::string(path).c_str());
+		return vr::VRInputError_InvalidSkeleton;
+	}
+
+	device->set_skeleton(std::span(pGripLimitTransforms, unGripLimitTransformCount), hand,
+	                     eSkeletalTrackingLevel == vr::VRSkeletalTracking_Estimated, pchSkeletonPath);
+	skeleton_to_controller[*pHandle] = device;
+
 	return vr::VRInputError_None;
 }
 
@@ -657,6 +661,22 @@ Context::UpdateSkeletonComponent(vr::VRInputComponentHandle_t ulComponent,
                                  const vr::VRBoneTransform_t *pTransforms,
                                  uint32_t unTransformCount)
 {
+	if (eMotionRange != vr::VRSkeletalMotionRange_WithoutController) {
+		return vr::VRInputError_None;
+	}
+
+	if (!update_component_common(ulComponent, 0)) {
+		return vr::VRInputError_InvalidHandle;
+	}
+
+	auto *device = skeleton_to_controller[ulComponent];
+	if (!device) {
+		CTX_ERR("Got unknown component handle %lu", ulComponent);
+		return vr::VRInputError_InvalidHandle;
+	}
+
+	device->update_skeleton_transforms(std::span(pTransforms, unTransformCount));
+
 	return vr::VRInputError_None;
 }
 
@@ -753,6 +773,16 @@ get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles)
 		out_roles->left = left;
 		out_roles->right = right;
 		out_roles->gamepad = gamepad;
+
+		if (left != XRT_DEVICE_ROLE_UNASSIGNED) {
+			auto *left_dev = static_cast<ControllerDevice *>(xsysd->xdevs[left]);
+			left_dev->set_active_hand(XRT_HAND_LEFT);
+		}
+
+		if (right != XRT_DEVICE_ROLE_UNASSIGNED) {
+			auto *right_dev = static_cast<ControllerDevice *>(xsysd->xdevs[right]);
+			right_dev->set_active_hand(XRT_HAND_RIGHT);
+		}
 	}
 
 	return XRT_SUCCESS;
